@@ -232,40 +232,59 @@ jobs:
             });
 
             return `
-          You are documenting code changes for a programming practice repository.
-
-          Pull request:
-          - Title: ${pr.title}
-          - Number: ${pr.number}
-          - Author: ${pr.user?.login || "unknown"}
-          - Source branch: ${branchName}
-          - Target branch: ${pr.base.ref}
-          - URL: ${pr.html_url}
-
-          PR description:
-          ${pr.body || "No description provided."}
-
-          Changed files and code:
-          ${JSON.stringify(fileDetails, null, 2)}
-
-          Analyze the whole PR diff as one complete change set.
-          Write a concise markdown summary of what the PR implements and the main ideas in the code.
-          Do not write separate explanation sections for every file unless it is necessary to understand the overall change.
-          Use this exact structure:
-
-          # AI Explanation - ${branchName}
-
-          ## Summary
-
-          ## Approach
-
-          ## Key Logic
-
-          ## Complexity and Tradeoffs
-
-          ## Run or Review Notes
-
-          Keep it concise, accurate, and beginner-friendly. Do not invent behavior that is not visible in the code or patch.
+            You are reviewing a GitHub pull request for a programming practice repository.
+              PR Metadata:
+              - Title: ${pr.title}
+              - Number: ${pr.number}
+              - Author: ${pr.user?.login || "unknown"}
+              - Source branch: ${branchName}
+              - Target branch: ${pr.base.ref}
+              - URL: ${pr.html_url}
+                          
+              PR Description:
+              ${pr.body || "No description provided."}
+              
+              Changed Files and Diffs:
+              ${JSON.stringify(fileDetails, null, 2)}
+              
+              Task:
+              
+              Analyze the complete pull request as one cohesive change, not as individual file modifications.
+              
+              Your goal is to understand:
+              - What feature, fix, or refactoring this PR introduces.
+              - How the implementation works across the repository.
+              - The overall logic and design decisions.
+              - Any important tradeoffs or review considerations.
+              
+              Avoid:
+              - Explaining every file individually.
+              - Repeating similar information for multiple files.
+              - Listing obvious line-by-line code changes.
+              - Adding assumptions about behavior that is not visible in the diff.
+              
+              Only mention individual files when they are essential to explaining the overall implementation.
+              
+              Generate the following markdown:
+              
+              # AI Explanation - ${branchName}
+              
+              ## Summary
+              A short overview of what this PR accomplishes.
+              
+              ## Approach
+              Describe the overall implementation strategy and how the different changes work together.
+              
+              ## Key Logic
+              Explain the important algorithms, data flow, architectural decisions, or implementation details introduced by the PR.
+              
+              ## Complexity and Tradeoffs
+              Mention any performance implications, maintainability considerations, or notable design tradeoffs visible from the code.
+              
+              ## Run or Review Notes
+              Include anything reviewers should pay attention to, testing considerations, or setup notes if applicable. If nothing special exists, state "None."
+              
+              Keep the explanation concise, technically accurate, and beginner-friendly. Focus on the PR as a whole rather than the individual files.
           `;
           }
 
