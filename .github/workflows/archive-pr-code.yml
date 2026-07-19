@@ -1,31 +1,49 @@
-name: Archive merged PR branch changes
+name: Archive PR code
 
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - main
     types:
-      - closed
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
 
 permissions:
   contents: write
   pull-requests: read
 
 jobs:
-  archive-branch-changes:
-    name: Archive branch changes on main
-    if: github.event.pull_request.merged == true && github.actor != 'github-actions[bot]'
+  archive-pr-code:
+    name: Archive PR files to code branch
+    if: github.event.pull_request.draft == false && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout main
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout or create code branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" repo
+          cd repo
 
-      - name: Copy changed files and generate AI explanation
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code origin code > /dev/null 2>&1; then
+            git fetch origin code
+            git checkout code
+          else
+            git checkout --orphan code
+            git rm -rf . > /dev/null 2>&1 || true
+            git commit --allow-empty -m "Initialize code branch"
+            git push origin code
+          fi
+
+      - name: Copy PR files and generate AI explanation
+        working-directory: repo
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL: ${{ vars.GROQ_MODEL }}
@@ -36,13 +54,13 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const path = require("path");
-          const { execFileSync } = require("child_process");
 
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const pr = event.pull_request;
           const repo = process.env.GITHUB_REPOSITORY;
           const token = process.env.GITHUB_TOKEN;
           const apiKey = process.env.GROQ_API_KEY;
+          const headSha = pr.head.sha;
 
           const FALLBACK_MODELS = [
             process.env.GROQ_MODEL,
@@ -60,13 +78,15 @@ jobs:
               .replace(/[^a-z0-9._-]+/g, "-")
               .replace(/^-+|-+$/g, "") || "unknown";
 
+          const encodeContentPath = (filename) =>
+            filename.split("/").map(encodeURIComponent).join("/");
+
           const branchName = pr.head.ref || `pr-${pr.number}`;
           const safeBranchName = safeName(branchName);
           const archiveRoot = safeBranchName;
           const changedFilesRoot = path.join(archiveRoot, "files");
           const explanationPath = path.join(archiveRoot, "AI_EXPLANATION.md");
           const metadataPath = path.join(archiveRoot, "PR_METADATA.md");
-          const baseSha = pr.base?.sha;
 
           async function githubGet(url) {
             const response = await fetch(url, {
@@ -100,12 +120,25 @@ jobs:
             return files;
           }
 
+          async function getFileContent(filename) {
+            const url = `https://api.github.com/repos/${repo}/contents/${encodeContentPath(filename)}?ref=${headSha}`;
+            try {
+              const data = await githubGet(url);
+              if (data.encoding === "base64" && data.content) {
+                return Buffer.from(data.content, "base64");
+              }
+            } catch (error) {
+              console.warn(`Skipping ${filename}: ${error.message}`);
+            }
+            return null;
+          }
+
           function resetDirectory(directory) {
             fs.rmSync(directory, { recursive: true, force: true });
             fs.mkdirSync(directory, { recursive: true });
           }
 
-          function copyChangedFiles(files) {
+          async function copyChangedFiles(files) {
             const copied = [];
             const deleted = [];
             const skipped = [];
@@ -116,77 +149,19 @@ jobs:
                 continue;
               }
 
-              if (!fs.existsSync(file.filename) || !fs.statSync(file.filename).isFile()) {
+              const content = await getFileContent(file.filename);
+              if (!content) {
                 skipped.push(file.filename);
                 continue;
               }
 
               const destination = path.join(changedFilesRoot, file.filename);
               fs.mkdirSync(path.dirname(destination), { recursive: true });
-              fs.copyFileSync(file.filename, destination);
+              fs.writeFileSync(destination, content);
               copied.push(file.filename);
             }
 
             return { copied, deleted, skipped };
-          }
-
-          function pathExistsInGit(ref, filename) {
-            try {
-              execFileSync("git", ["cat-file", "-e", `${ref}:${filename}`], { stdio: "ignore" });
-              return true;
-            } catch {
-              return false;
-            }
-          }
-
-          function restoreFromBase(filename) {
-            if (!baseSha || !pathExistsInGit(baseSha, filename)) {
-              fs.rmSync(filename, { recursive: true, force: true });
-              return "removed because no pre-merge version was found";
-            }
-
-            fs.mkdirSync(path.dirname(filename), { recursive: true });
-            execFileSync("git", ["checkout", baseSha, "--", filename], { stdio: "inherit" });
-            return "restored to the pre-merge main version";
-          }
-
-          function cleanupMergedOriginals(files) {
-            const cleanup = [];
-
-            for (const file of files) {
-              if (file.filename.startsWith(`${archiveRoot}/`)) {
-                cleanup.push({ file: file.filename, action: "kept archived file" });
-                continue;
-              }
-
-              if (file.status === "added" || file.status === "copied") {
-                fs.rmSync(file.filename, { recursive: true, force: true });
-                cleanup.push({ file: file.filename, action: "removed merged branch-only file from main root" });
-                continue;
-              }
-
-              if (file.status === "renamed") {
-                fs.rmSync(file.filename, { recursive: true, force: true });
-                const previous = file.previous_filename || file.filename;
-                const action = restoreFromBase(previous);
-                cleanup.push({
-                  file: file.filename,
-                  previous_filename: previous,
-                  action: `removed renamed path and ${action}`,
-                });
-                continue;
-              }
-
-              if (file.status === "modified" || file.status === "changed" || file.status === "removed") {
-                const action = restoreFromBase(file.filename);
-                cleanup.push({ file: file.filename, action });
-                continue;
-              }
-
-              cleanup.push({ file: file.filename, action: `no cleanup rule for status: ${file.status}` });
-            }
-
-            return cleanup;
           }
 
           function readTextPreview(filename) {
@@ -207,26 +182,21 @@ jobs:
             }
           }
 
-          function buildMetadata(files, archiveInfo, cleanupInfo) {
+          function buildMetadata(files, archiveInfo) {
             const fileRows = files.map((file) => {
               const previous = file.previous_filename ? ` (renamed from ${file.previous_filename})` : "";
               return `- \`${file.filename}\` - ${file.status}${previous}, +${file.additions || 0}/-${file.deletions || 0}`;
             }).join("\n") || "- No changed files were reported.";
 
-            const cleanupRows = cleanupInfo.map((item) => {
-              const previous = item.previous_filename ? `, previous path: \`${item.previous_filename}\`` : "";
-              return `- \`${item.file}\` - ${item.action}${previous}`;
-            }).join("\n") || "- No cleanup actions were needed.";
-
             return [
-              `# PR Archive - ${branchName}`,
+              `# PR Code Archive - ${branchName}`,
               "",
               `- PR: [#${pr.number} ${pr.title}](${pr.html_url})`,
               `- Source branch: \`${branchName}\``,
-              `- Merged by: @${pr.merged_by?.login || "unknown"}`,
+              `- Target branch: \`${pr.base.ref}\``,
               `- Author: @${pr.user?.login || "unknown"}`,
-              `- Merged at: ${pr.merged_at}`,
-              `- Merge commit: \`${pr.merge_commit_sha || "unknown"}\``,
+              `- PR head SHA: \`${headSha}\``,
+              `- Last updated: ${new Date().toISOString()}`,
               "",
               "## Files Changed",
               "",
@@ -234,16 +204,11 @@ jobs:
               "",
               "## Archive Notes",
               "",
+              `- This folder is generated on the \`code\` branch when the PR is opened or updated.`,
               `- Copied files are stored in \`${changedFilesRoot}/\`.`,
               `- Copied: ${archiveInfo.copied.length}`,
               `- Deleted in PR: ${archiveInfo.deleted.length}`,
               `- Skipped: ${archiveInfo.skipped.length}`,
-              "",
-              "## Main Cleanup",
-              "",
-              "After archiving, the workflow removes branch-only files from the root of `main` and restores existing files to their pre-merge `main` version.",
-              "",
-              cleanupRows,
             ].join("\n");
           }
 
@@ -274,7 +239,7 @@ jobs:
           - Number: ${pr.number}
           - Author: ${pr.user?.login || "unknown"}
           - Source branch: ${branchName}
-          - Merged at: ${pr.merged_at}
+          - Target branch: ${pr.base.ref}
           - URL: ${pr.html_url}
 
           PR description:
@@ -312,7 +277,7 @@ jobs:
               "",
               "## Overview",
               "",
-              `This archive was created after PR #${pr.number} was merged into main. AI generation was unavailable, so this file contains a metadata-based summary.`,
+              `This archive was created from PR #${pr.number}. AI generation was unavailable, so this file contains a metadata-based summary.`,
               "",
               "## File-by-File Explanation",
               "",
@@ -349,8 +314,7 @@ jobs:
 
             if (!response.ok) {
               const body = await response.text();
-              const isRateLimit = response.status === 429 || body.includes("rate_limit") || body.includes("Rate limit");
-              throw Object.assign(new Error(`Groq API failed [${model}]: ${response.status} ${body}`), { isRateLimit });
+              throw new Error(`Groq API failed [${model}]: ${response.status} ${body}`);
             }
 
             const data = await response.json();
@@ -420,9 +384,8 @@ jobs:
             const files = await getChangedFiles();
             resetDirectory(archiveRoot);
 
-            const archiveInfo = copyChangedFiles(files);
-            const cleanupInfo = cleanupMergedOriginals(files);
-            const metadata = buildMetadata(files, archiveInfo, cleanupInfo);
+            const archiveInfo = await copyChangedFiles(files);
+            const metadata = buildMetadata(files, archiveInfo);
             fs.writeFileSync(metadataPath, `${metadata}\n`, "utf8");
 
             let explanation;
@@ -442,14 +405,13 @@ jobs:
           });
           NODE
 
-      - name: Commit archive to main
+      - name: Commit archive to code branch
+        working-directory: repo
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .
           if git diff --cached --quiet; then
-            echo "No archive changes to commit."
+            echo "No code archive changes to commit."
           else
-            git commit -m "Archive merged PR branch changes"
-            git push origin main
+            git commit -m "Archive PR #${{ github.event.pull_request.number }} code"
+            git push origin code
           fi
