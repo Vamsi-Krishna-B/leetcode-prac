@@ -1,7 +1,7 @@
 from collections import defaultdict
 from typing import List
 class Solution:
-    def groupAnagrams(self, strs: List[str]) -> List[List[str]]:
+    def group_anagrams(self, strs: List[str]) -> List[List[str]]:
         hash_map = defaultdict(list)
         for st in strs:
             key = "".join(sorted(st))
