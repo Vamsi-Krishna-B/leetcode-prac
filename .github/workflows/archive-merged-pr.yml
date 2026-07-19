@@ -22,6 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: main
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Copy changed files and generate AI explanation
@@ -35,6 +36,7 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const path = require("path");
+          const { execFileSync } = require("child_process");
 
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const pr = event.pull_request;
@@ -64,6 +66,7 @@ jobs:
           const changedFilesRoot = path.join(archiveRoot, "files");
           const explanationPath = path.join(archiveRoot, "AI_EXPLANATION.md");
           const metadataPath = path.join(archiveRoot, "PR_METADATA.md");
+          const baseSha = pr.base?.sha;
 
           async function githubGet(url) {
             const response = await fetch(url, {
@@ -127,6 +130,65 @@ jobs:
             return { copied, deleted, skipped };
           }
 
+          function pathExistsInGit(ref, filename) {
+            try {
+              execFileSync("git", ["cat-file", "-e", `${ref}:${filename}`], { stdio: "ignore" });
+              return true;
+            } catch {
+              return false;
+            }
+          }
+
+          function restoreFromBase(filename) {
+            if (!baseSha || !pathExistsInGit(baseSha, filename)) {
+              fs.rmSync(filename, { recursive: true, force: true });
+              return "removed because no pre-merge version was found";
+            }
+
+            fs.mkdirSync(path.dirname(filename), { recursive: true });
+            execFileSync("git", ["checkout", baseSha, "--", filename], { stdio: "inherit" });
+            return "restored to the pre-merge main version";
+          }
+
+          function cleanupMergedOriginals(files) {
+            const cleanup = [];
+
+            for (const file of files) {
+              if (file.filename.startsWith(`${archiveRoot}/`)) {
+                cleanup.push({ file: file.filename, action: "kept archived file" });
+                continue;
+              }
+
+              if (file.status === "added" || file.status === "copied") {
+                fs.rmSync(file.filename, { recursive: true, force: true });
+                cleanup.push({ file: file.filename, action: "removed merged branch-only file from main root" });
+                continue;
+              }
+
+              if (file.status === "renamed") {
+                fs.rmSync(file.filename, { recursive: true, force: true });
+                const previous = file.previous_filename || file.filename;
+                const action = restoreFromBase(previous);
+                cleanup.push({
+                  file: file.filename,
+                  previous_filename: previous,
+                  action: `removed renamed path and ${action}`,
+                });
+                continue;
+              }
+
+              if (file.status === "modified" || file.status === "changed" || file.status === "removed") {
+                const action = restoreFromBase(file.filename);
+                cleanup.push({ file: file.filename, action });
+                continue;
+              }
+
+              cleanup.push({ file: file.filename, action: `no cleanup rule for status: ${file.status}` });
+            }
+
+            return cleanup;
+          }
+
           function readTextPreview(filename) {
             try {
               const stats = fs.statSync(filename);
@@ -145,11 +207,16 @@ jobs:
             }
           }
 
-          function buildMetadata(files, archiveInfo) {
+          function buildMetadata(files, archiveInfo, cleanupInfo) {
             const fileRows = files.map((file) => {
               const previous = file.previous_filename ? ` (renamed from ${file.previous_filename})` : "";
               return `- \`${file.filename}\` - ${file.status}${previous}, +${file.additions || 0}/-${file.deletions || 0}`;
             }).join("\n") || "- No changed files were reported.";
+
+            const cleanupRows = cleanupInfo.map((item) => {
+              const previous = item.previous_filename ? `, previous path: \`${item.previous_filename}\`` : "";
+              return `- \`${item.file}\` - ${item.action}${previous}`;
+            }).join("\n") || "- No cleanup actions were needed.";
 
             return [
               `# PR Archive - ${branchName}`,
@@ -171,6 +238,12 @@ jobs:
               `- Copied: ${archiveInfo.copied.length}`,
               `- Deleted in PR: ${archiveInfo.deleted.length}`,
               `- Skipped: ${archiveInfo.skipped.length}`,
+              "",
+              "## Main Cleanup",
+              "",
+              "After archiving, the workflow removes branch-only files from the root of `main` and restores existing files to their pre-merge `main` version.",
+              "",
+              cleanupRows,
             ].join("\n");
           }
 
@@ -348,7 +421,8 @@ jobs:
             resetDirectory(archiveRoot);
 
             const archiveInfo = copyChangedFiles(files);
-            const metadata = buildMetadata(files, archiveInfo);
+            const cleanupInfo = cleanupMergedOriginals(files);
+            const metadata = buildMetadata(files, archiveInfo, cleanupInfo);
             fs.writeFileSync(metadataPath, `${metadata}\n`, "utf8");
 
             let explanation;
